@@ -3,6 +3,7 @@ import os
 import shutil
 import csv
 from datetime import date, datetime, time
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict, Any
 from contextlib import contextmanager
 
@@ -10,6 +11,25 @@ from .models import (
     Patient, Visit, Photo, Note, DATA_DIR,
     PHOTO_STATUS_PENDING, PHOTO_STATUS_TAKEN, PHOTO_STATUS_MISSING, PHOTO_STATUS_SKIPPED
 )
+
+
+@dataclass
+class ImportResult:
+    imported: List[str] = field(default_factory=list)
+    skipped_duplicate: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+
+    @property
+    def total_imported(self) -> int:
+        return len(self.imported)
+
+    @property
+    def total_skipped(self) -> int:
+        return len(self.skipped_duplicate)
+
+    @property
+    def total_errors(self) -> int:
+        return len(self.errors)
 
 try:
     from openpyxl import load_workbook
@@ -22,6 +42,78 @@ try:
     HAS_XLRD = True
 except ImportError:
     HAS_XLRD = False
+
+
+def _parse_time_value(raw_value) -> Optional[time]:
+    if raw_value is None or raw_value == '':
+        return None
+
+    if isinstance(raw_value, time):
+        return raw_value
+
+    if isinstance(raw_value, datetime):
+        return raw_value.time()
+
+    if isinstance(raw_value, date):
+        return None
+
+    if isinstance(raw_value, (int, float)):
+        try:
+            total_seconds = int(round(float(raw_value) * 86400))
+            hours = (total_seconds // 3600) % 24
+            minutes = (total_seconds % 3600) // 60
+            seconds = total_seconds % 60
+            if 0 <= hours <= 23 and 0 <= minutes <= 59:
+                return time(hours, minutes, seconds)
+        except (ValueError, OverflowError):
+            pass
+        try:
+            if HAS_XLRD:
+                dt = xlrd.xldate_as_datetime(float(raw_value), 0)
+                return dt.time()
+        except Exception:
+            pass
+
+    time_str = str(raw_value).strip()
+    if not time_str:
+        return None
+
+    for fmt in ['%H:%M:%S', '%H:%M', '%H.%M', '%H点%M分', '%H:%M:00']:
+        try:
+            return datetime.strptime(time_str, fmt).time()
+        except ValueError:
+            continue
+
+    if len(time_str) in (3, 4) and time_str.isdigit():
+        h = int(time_str[:-2]) if len(time_str) == 4 else int(time_str[0])
+        m = int(time_str[-2:])
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return time(h, m)
+
+    return None
+
+
+def _parse_int_value(raw_value) -> Optional[int]:
+    if raw_value is None or raw_value == '':
+        return None
+    if isinstance(raw_value, (int, float)):
+        ival = int(round(float(raw_value)))
+        return ival if ival > 0 else None
+    s = str(raw_value).strip()
+    if s and s.replace('.', '').isdigit():
+        ival = int(round(float(s)))
+        return ival if ival > 0 else None
+    return None
+
+
+def _str_value(raw_value) -> str:
+    if raw_value is None:
+        return ''
+    if isinstance(raw_value, (int, float)):
+        if isinstance(raw_value, float) and raw_value == int(raw_value):
+            return str(int(raw_value))
+        return str(raw_value)
+    return str(raw_value).strip()
 
 
 @contextmanager
@@ -251,127 +343,121 @@ class Database:
         return results
 
     @staticmethod
-    def import_appointments_from_csv(file_path: str, visit_date: Optional[date] = None) -> Tuple[int, List[str]]:
+    def _process_single_appointment(
+        row_dict: Dict[str, Any],
+        row_num: int,
+        visit_date: date,
+        result: ImportResult
+    ) -> None:
+        try:
+            name = _str_value(row_dict.get('姓名', ''))
+            if not name:
+                result.errors.append(f'第{row_num}行：姓名为空，已跳过')
+                return
+
+            phone = _str_value(row_dict.get('电话', row_dict.get('手机号', row_dict.get('手机', ''))))
+            medical_record_number = _str_value(row_dict.get('病历号', ''))
+            treatment_plan = _str_value(row_dict.get('治疗方案', row_dict.get('疗程', '')))
+            age = _parse_int_value(row_dict.get('年龄', ''))
+            gender = _str_value(row_dict.get('性别', ''))
+
+            raw_time = row_dict.get('时间段', row_dict.get('预约时间', row_dict.get('时间', '')))
+            appointment_time = _parse_time_value(raw_time)
+
+            patient = None
+            if medical_record_number:
+                patient = Database.find_patient_by_identifier(medical_record_number)
+            if not patient and phone:
+                patient = Database.find_patient_by_identifier(phone)
+            if not patient:
+                existing = Database.find_patients_by_name(name)
+                if len(existing) == 1:
+                    patient = existing[0]
+                elif len(existing) > 1:
+                    result.errors.append(f'第{row_num}行：存在多名叫「{name}」的患者，请填写电话或病历号区分')
+                    return
+
+            if not patient:
+                patient = Patient(
+                    name=name,
+                    phone=phone,
+                    medical_record_number=medical_record_number,
+                    age=age,
+                    gender=gender,
+                    treatment_plan=treatment_plan
+                )
+                patient_id = Database.add_patient(patient)
+                patient.id = patient_id
+            else:
+                updated = False
+                if phone and not patient.phone:
+                    patient.phone = phone
+                    updated = True
+                if medical_record_number and not patient.medical_record_number:
+                    patient.medical_record_number = medical_record_number
+                    updated = True
+                if age and not patient.age:
+                    patient.age = age
+                    updated = True
+                if updated:
+                    Database.update_patient(patient)
+
+            existing_visits = Database.get_patient_visits(patient.id)
+            has_visit = any(v.visit_date == visit_date for v in existing_visits)
+
+            if not has_visit:
+                visit = Visit(
+                    patient_id=patient.id,
+                    visit_date=visit_date,
+                    appointment_time=appointment_time,
+                    stage_code='month1'
+                )
+                Database.add_visit(visit)
+                time_str = appointment_time.strftime('%H:%M') if appointment_time else '未安排'
+                result.imported.append(f'第{row_num}行：{name} ({time_str})')
+            else:
+                time_str = appointment_time.strftime('%H:%M') if appointment_time else '未安排'
+                result.skipped_duplicate.append(f'第{row_num}行：{name} ({time_str}) — 当日已有预约')
+
+        except Exception as e:
+            result.errors.append(f'第{row_num}行处理出错：{str(e)}')
+
+    @staticmethod
+    def import_appointments_from_csv(file_path: str, visit_date: Optional[date] = None) -> ImportResult:
         if visit_date is None:
             visit_date = date.today()
 
-        imported_count = 0
-        errors = []
-
-        required_columns = ['姓名']
-        optional_columns = ['电话', '手机号', '手机', '病历号', '时间段', '预约时间', '时间', '治疗方案', '疗程', '年龄', '性别']
+        result = ImportResult()
 
         try:
             with open(file_path, 'r', encoding='utf-8-sig') as f:
                 reader = csv.DictReader(f)
 
                 if reader.fieldnames is None:
-                    errors.append('CSV文件格式错误，无法读取表头')
-                    return 0, errors
+                    result.errors.append('CSV文件格式错误，无法读取表头')
+                    return result
 
-                found_cols = [col for col in required_columns if col in reader.fieldnames]
-                if not found_cols:
-                    errors.append(f'缺少必要列：{required_columns}，当前表头：{reader.fieldnames}')
-                    return 0, errors
+                if '姓名' not in reader.fieldnames:
+                    result.errors.append(f'缺少必要列：姓名，当前表头：{reader.fieldnames}')
+                    return result
 
                 for row_num, row in enumerate(reader, start=2):
-                    try:
-                        name = row.get('姓名', '').strip()
-                        if not name:
-                            errors.append(f'第{row_num}行：姓名为空，已跳过')
-                            continue
-
-                        phone = row.get('电话', row.get('手机号', row.get('手机', ''))).strip()
-                        medical_record_number = row.get('病历号', '').strip()
-                        treatment_plan = row.get('治疗方案', row.get('疗程', '')).strip()
-
-                        age_str = row.get('年龄', '').strip()
-                        age = int(age_str) if age_str.isdigit() else None
-                        gender = row.get('性别', '').strip()
-
-                        time_str = row.get('时间段', row.get('预约时间', row.get('时间', ''))).strip()
-                        appointment_time = None
-                        if time_str:
-                            for fmt in ['%H:%M', '%H.%M', '%H点%M分', '%H:%M:%S']:
-                                try:
-                                    appointment_time = datetime.strptime(time_str, fmt).time()
-                                    break
-                                except ValueError:
-                                    continue
-
-                        patient = None
-                        if medical_record_number:
-                            patient = Database.find_patient_by_identifier(medical_record_number)
-                        if not patient and phone:
-                            patient = Database.find_patient_by_identifier(phone)
-                        if not patient:
-                            existing = Database.find_patients_by_name(name)
-                            if len(existing) == 1:
-                                patient = existing[0]
-                            elif len(existing) > 1:
-                                errors.append(f'第{row_num}行：存在多名叫「{name}」的患者，请在CSV中填写电话或病历号区分')
-                                continue
-
-                        if not patient:
-                            patient = Patient(
-                                name=name,
-                                phone=phone,
-                                medical_record_number=medical_record_number,
-                                age=age,
-                                gender=gender,
-                                treatment_plan=treatment_plan
-                            )
-                            patient_id = Database.add_patient(patient)
-                            patient.id = patient_id
-                        else:
-                            updated = False
-                            if phone and not patient.phone:
-                                patient.phone = phone
-                                updated = True
-                            if medical_record_number and not patient.medical_record_number:
-                                patient.medical_record_number = medical_record_number
-                                updated = True
-                            if age and not patient.age:
-                                patient.age = age
-                                updated = True
-                            if updated:
-                                Database.update_patient(patient)
-
-                        existing_visits = Database.get_patient_visits(patient.id)
-                        has_today_visit = any(v.visit_date == visit_date for v in existing_visits)
-
-                        if not has_today_visit:
-                            visit = Visit(
-                                patient_id=patient.id,
-                                visit_date=visit_date,
-                                appointment_time=appointment_time,
-                                stage_code='month1'
-                            )
-                            Database.add_visit(visit)
-                            imported_count += 1
-                        else:
-                            errors.append(f'第{row_num}行：{name} 今日已有预约，已跳过')
-
-                    except Exception as e:
-                        errors.append(f'第{row_num}行处理出错：{str(e)}')
-                        continue
+                    Database._process_single_appointment(row, row_num, visit_date, result)
 
         except Exception as e:
-            errors.append(f'读取CSV文件失败：{str(e)}')
-            return 0, errors
+            result.errors.append(f'读取CSV文件失败：{str(e)}')
 
-        return imported_count, errors
+        return result
 
     @staticmethod
-    def import_appointments_from_excel(file_path: str, visit_date: Optional[date] = None) -> Tuple[int, List[str]]:
+    def import_appointments_from_excel(file_path: str, visit_date: Optional[date] = None) -> ImportResult:
         if not HAS_OPENPYXL:
-            return 0, ['未安装 openpyxl 库，无法读取 Excel 文件。请运行：pip install openpyxl']
+            return ImportResult(errors=['未安装 openpyxl 库，无法读取 XLSX 文件。请运行：pip install openpyxl'])
 
         if visit_date is None:
             visit_date = date.today()
 
-        imported_count = 0
-        errors = []
+        result = ImportResult()
 
         try:
             wb = load_workbook(file_path, data_only=True)
@@ -379,244 +465,74 @@ class Database:
 
             rows = list(ws.iter_rows(values_only=True))
             if not rows:
-                errors.append('Excel文件为空')
-                return 0, errors
+                result.errors.append('XLSX文件为空')
+                return result
 
-            headers = [str(cell).strip() if cell is not None else '' for cell in rows[0]]
+            headers = [_str_value(cell) for cell in rows[0]]
 
             if '姓名' not in headers:
-                errors.append(f'缺少必要列：姓名，当前表头：{headers}')
-                return 0, errors
+                result.errors.append(f'缺少必要列：姓名，当前表头：{headers}')
+                return result
 
             for row_num, row in enumerate(rows[1:], start=2):
-                try:
-                    row_dict = {headers[i]: str(row[i]).strip() if row[i] is not None else '' for i in range(len(headers))}
-
-                    name = row_dict.get('姓名', '').strip()
-                    if not name:
-                        errors.append(f'第{row_num}行：姓名为空，已跳过')
-                        continue
-
-                    phone = row_dict.get('电话', row_dict.get('手机号', row_dict.get('手机', ''))).strip()
-                    medical_record_number = row_dict.get('病历号', '').strip()
-                    treatment_plan = row_dict.get('治疗方案', row_dict.get('疗程', '')).strip()
-
-                    age_str = row_dict.get('年龄', '').strip()
-                    age = int(age_str) if age_str.isdigit() else None
-                    gender = row_dict.get('性别', '').strip()
-
-                    time_str = row_dict.get('时间段', row_dict.get('预约时间', row_dict.get('时间', ''))).strip()
-                    appointment_time = None
-                    if time_str:
-                        for fmt in ['%H:%M', '%H.%M', '%H点%M分', '%H:%M:%S']:
-                            try:
-                                appointment_time = datetime.strptime(time_str, fmt).time()
-                                break
-                            except ValueError:
-                                continue
-                        if appointment_time is None:
-                            try:
-                                t = datetime.strptime(time_str, '%H:%M:%S').time()
-                                appointment_time = t
-                            except ValueError:
-                                pass
-
-                    patient = None
-                    if medical_record_number:
-                        patient = Database.find_patient_by_identifier(medical_record_number)
-                    if not patient and phone:
-                        patient = Database.find_patient_by_identifier(phone)
-                    if not patient:
-                        existing = Database.find_patients_by_name(name)
-                        if len(existing) == 1:
-                            patient = existing[0]
-                        elif len(existing) > 1:
-                            errors.append(f'第{row_num}行：存在多名叫「{name}」的患者，请填写电话或病历号区分')
-                            continue
-
-                    if not patient:
-                        patient = Patient(
-                            name=name,
-                            phone=phone,
-                            medical_record_number=medical_record_number,
-                            age=age,
-                            gender=gender,
-                            treatment_plan=treatment_plan
-                        )
-                        patient_id = Database.add_patient(patient)
-                        patient.id = patient_id
+                row_dict = {}
+                for i in range(len(headers)):
+                    if i < len(row):
+                        row_dict[headers[i]] = row[i]
                     else:
-                        updated = False
-                        if phone and not patient.phone:
-                            patient.phone = phone
-                            updated = True
-                        if medical_record_number and not patient.medical_record_number:
-                            patient.medical_record_number = medical_record_number
-                            updated = True
-                        if age and not patient.age:
-                            patient.age = age
-                            updated = True
-                        if updated:
-                            Database.update_patient(patient)
-
-                    existing_visits = Database.get_patient_visits(patient.id)
-                    has_today_visit = any(v.visit_date == visit_date for v in existing_visits)
-
-                    if not has_today_visit:
-                        visit = Visit(
-                            patient_id=patient.id,
-                            visit_date=visit_date,
-                            appointment_time=appointment_time,
-                            stage_code='month1'
-                        )
-                        Database.add_visit(visit)
-                        imported_count += 1
-                    else:
-                        errors.append(f'第{row_num}行：{name} 今日已有预约，已跳过')
-
-                except Exception as e:
-                    errors.append(f'第{row_num}行处理出错：{str(e)}')
-                    continue
+                        row_dict[headers[i]] = ''
+                Database._process_single_appointment(row_dict, row_num, visit_date, result)
 
         except Exception as e:
-            errors.append(f'读取Excel文件失败：{str(e)}')
-            return 0, errors
+            result.errors.append(f'读取XLSX文件失败：{str(e)}')
 
-        return imported_count, errors
+        return result
 
     @staticmethod
-    def import_appointments_from_xls(file_path: str, visit_date: Optional[date] = None) -> Tuple[int, List[str]]:
+    def import_appointments_from_xls(file_path: str, visit_date: Optional[date] = None) -> ImportResult:
         if not HAS_XLRD:
-            return 0, ['未安装 xlrd 库，无法读取 XLS 文件。请运行：pip install xlrd==1.2.0']
+            return ImportResult(errors=['未安装 xlrd 库，无法读取 XLS 文件。请运行：pip install xlrd==1.2.0'])
 
         if visit_date is None:
             visit_date = date.today()
 
-        imported_count = 0
-        errors = []
+        result = ImportResult()
 
         try:
             workbook = xlrd.open_workbook(file_path)
             sheet = workbook.sheet_by_index(0)
 
             if sheet.nrows < 1:
-                errors.append('XLS文件为空')
-                return 0, errors
+                result.errors.append('XLS文件为空')
+                return result
 
-            headers = [str(sheet.cell_value(0, col)).strip() for col in range(sheet.ncols)]
+            headers = [_str_value(sheet.cell_value(0, col)) for col in range(sheet.ncols)]
 
             if '姓名' not in headers:
-                errors.append(f'缺少必要列：姓名，当前表头：{headers}')
-                return 0, errors
+                result.errors.append(f'缺少必要列：姓名，当前表头：{headers}')
+                return result
 
             for row_num in range(1, sheet.nrows):
-                try:
-                    row_dict = {}
-                    for col in range(sheet.ncols):
-                        cell_val = sheet.cell_value(row_num, col)
-                        if isinstance(cell_val, float) and cell_val == int(cell_val):
-                            cell_val = str(int(cell_val))
-                        else:
-                            cell_val = str(cell_val).strip()
-                        row_dict[headers[col]] = cell_val
-
-                    name = row_dict.get('姓名', '').strip()
-                    if not name:
-                        errors.append(f'第{row_num + 1}行：姓名为空，已跳过')
-                        continue
-
-                    phone = row_dict.get('电话', row_dict.get('手机号', row_dict.get('手机', ''))).strip()
-                    medical_record_number = row_dict.get('病历号', '').strip()
-                    treatment_plan = row_dict.get('治疗方案', row_dict.get('疗程', '')).strip()
-
-                    age_str = row_dict.get('年龄', '').strip()
-                    age = int(float(age_str)) if age_str and age_str.replace('.', '').isdigit() else None
-                    gender = row_dict.get('性别', '').strip()
-
-                    time_str = row_dict.get('时间段', row_dict.get('预约时间', row_dict.get('时间', ''))).strip()
-                    appointment_time = None
-                    if time_str:
-                        for fmt in ['%H:%M', '%H.%M', '%H点%M分', '%H:%M:%S']:
-                            try:
-                                appointment_time = datetime.strptime(time_str, fmt).time()
-                                break
-                            except ValueError:
-                                continue
-                        if appointment_time is None:
-                            try:
-                                if ':' in time_str:
-                                    parts = time_str.split(':')
-                                    h = int(parts[0])
-                                    m = int(parts[1]) if len(parts) > 1 else 0
-                                    appointment_time = time(h, m)
-                            except (ValueError, IndexError):
-                                pass
-
-                    patient = None
-                    if medical_record_number:
-                        patient = Database.find_patient_by_identifier(medical_record_number)
-                    if not patient and phone:
-                        patient = Database.find_patient_by_identifier(phone)
-                    if not patient:
-                        existing = Database.find_patients_by_name(name)
-                        if len(existing) == 1:
-                            patient = existing[0]
-                        elif len(existing) > 1:
-                            errors.append(f'第{row_num + 1}行：存在多名叫「{name}」的患者，请填写电话或病历号区分')
-                            continue
-
-                    if not patient:
-                        patient = Patient(
-                            name=name,
-                            phone=phone,
-                            medical_record_number=medical_record_number,
-                            age=age,
-                            gender=gender,
-                            treatment_plan=treatment_plan
-                        )
-                        patient_id = Database.add_patient(patient)
-                        patient.id = patient_id
-                    else:
-                        updated = False
-                        if phone and not patient.phone:
-                            patient.phone = phone
-                            updated = True
-                        if medical_record_number and not patient.medical_record_number:
-                            patient.medical_record_number = medical_record_number
-                            updated = True
-                        if age and not patient.age:
-                            patient.age = age
-                            updated = True
-                        if updated:
-                            Database.update_patient(patient)
-
-                    existing_visits = Database.get_patient_visits(patient.id)
-                    has_today_visit = any(v.visit_date == visit_date for v in existing_visits)
-
-                    if not has_today_visit:
-                        visit = Visit(
-                            patient_id=patient.id,
-                            visit_date=visit_date,
-                            appointment_time=appointment_time,
-                            stage_code='month1'
-                        )
-                        Database.add_visit(visit)
-                        imported_count += 1
-                    else:
-                        errors.append(f'第{row_num + 1}行：{name} 今日已有预约，已跳过')
-
-                except Exception as e:
-                    errors.append(f'第{row_num + 1}行处理出错：{str(e)}')
-                    continue
+                row_dict = {}
+                for col in range(sheet.ncols):
+                    cell_val = sheet.cell_value(row_num, col)
+                    ctype = sheet.cell_type(row_num, col)
+                    if ctype == xlrd.XL_CELL_DATE and HAS_XLRD:
+                        try:
+                            dt = xlrd.xldate_as_datetime(cell_val, workbook.datemode)
+                            cell_val = dt
+                        except Exception:
+                            pass
+                    row_dict[headers[col]] = cell_val
+                Database._process_single_appointment(row_dict, row_num + 1, visit_date, result)
 
         except Exception as e:
-            errors.append(f'读取XLS文件失败：{str(e)}')
-            return 0, errors
+            result.errors.append(f'读取XLS文件失败：{str(e)}')
 
-        return imported_count, errors
+        return result
 
     @staticmethod
-    def import_appointments(file_path: str, visit_date: Optional[date] = None) -> Tuple[int, List[str]]:
+    def import_appointments(file_path: str, visit_date: Optional[date] = None) -> ImportResult:
         ext = os.path.splitext(file_path)[1].lower()
         if ext == '.csv':
             return Database.import_appointments_from_csv(file_path, visit_date)
@@ -625,7 +541,7 @@ class Database:
         elif ext == '.xls':
             return Database.import_appointments_from_xls(file_path, visit_date)
         else:
-            return 0, [f'不支持的文件格式：{ext}，请使用 CSV 或 Excel 文件']
+            return ImportResult(errors=[f'不支持的文件格式：{ext}，请使用 CSV 或 Excel 文件'])
 
     @staticmethod
     def add_visit(visit: Visit) -> int:
