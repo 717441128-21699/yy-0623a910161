@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QMessageBox, QDialog, QComboBox, QFrame, QScrollArea,
@@ -7,7 +8,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QPoint, QRect, QSize
 from PySide6.QtGui import (
     QPixmap, QFont, QPainter, QColor, QPen, QBrush,
-    QMouseEvent, QPaintEvent
+    QMouseEvent, QPaintEvent, QImage
 )
 
 from .database import Database
@@ -203,6 +204,82 @@ class PhotoCompareWidget(QFrame):
                 self.zoom = max(self.zoom / 1.1, 0.3)
             self.update()
 
+    def render_to_image(self, width: int = 800, height: int = 600) -> QImage:
+        image = QImage(width, height, QImage.Format_RGB32)
+        image.fill(QColor(33, 33, 33))
+
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+        rect = QRect(0, 0, width, height)
+
+        if not self.photo or not os.path.exists(self.photo.file_path):
+            painter.setPen(QColor(158, 158, 158))
+            painter.setFont(QFont('Arial', 16))
+            painter.drawText(rect, Qt.AlignCenter, '暂无照片')
+            painter.end()
+            return image
+
+        pixmap = QPixmap(self.photo.file_path)
+        if pixmap.isNull():
+            painter.setPen(QColor(158, 158, 158))
+            painter.drawText(rect, Qt.AlignCenter, '照片加载失败')
+            painter.end()
+            return image
+
+        scaled_pixmap = pixmap.scaled(
+            width, height,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+
+        x = (width - scaled_pixmap.width()) // 2
+        y = (height - scaled_pixmap.height()) // 2
+        img_rect = QRect(x, y, scaled_pixmap.width(), scaled_pixmap.height())
+
+        painter.drawPixmap(x, y, scaled_pixmap)
+
+        if self.show_ruler:
+            pen = QPen(QColor(255, 255, 255, 180))
+            pen.setWidth(1)
+            pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+
+            center_x = width // 2
+            center_y = height // 2
+
+            painter.drawLine(center_x, 0, center_x, height)
+            painter.drawLine(0, center_y, width, center_y)
+            painter.drawLine(0, height // 3, width, height // 3)
+            painter.drawLine(0, height * 2 // 3, width, height * 2 // 3)
+            painter.drawLine(width // 3, 0, width // 3, height)
+            painter.drawLine(width * 2 // 3, 0, width * 2 // 3, height)
+
+        for note in self.notes:
+            note_x = x + int(note.x * scaled_pixmap.width())
+            note_y = y + int(note.y * scaled_pixmap.height())
+
+            painter.setBrush(QBrush(QColor(244, 67, 54, 200)))
+            painter.setPen(QPen(QColor(255, 255, 255), 2))
+            painter.drawEllipse(note_x - 10, note_y - 10, 20, 20)
+
+            painter.setPen(QPen(QColor(255, 255, 255)))
+            painter.setFont(QFont('Arial', 11, QFont.Bold))
+            painter.drawText(note_x - 5, note_y + 5, '!')
+
+            label_rect = QRect(note_x + 20, note_y - 25, 200, 50)
+            painter.setBrush(QBrush(QColor(0, 0, 0, 180)))
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(label_rect, 6, 6)
+
+            painter.setPen(QPen(QColor(255, 255, 255)))
+            painter.setFont(QFont('Arial', 10))
+            painter.drawText(label_rect.adjusted(10, 6, -8, -8), Qt.TextWordWrap, note.content)
+
+        painter.end()
+        return image
+
 
 class CompareWindow(QDialog):
     compare_finished = Signal()
@@ -255,6 +332,26 @@ class CompareWindow(QDialog):
         self.ruler_checkbox.setStyleSheet('padding: 8px;')
         self.ruler_checkbox.toggled.connect(self._toggle_ruler)
         header_layout.addWidget(self.ruler_checkbox)
+
+        header_layout.addSpacing(10)
+
+        self.export_btn = QPushButton('📄  导出对比报告')
+        self.export_btn.setStyleSheet('''
+            QPushButton {
+                background: #4caf50;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 6px;
+                font-size: 14px;
+            }
+            QPushButton:hover { background: #388e3c; }
+            QPushButton:disabled {
+                background: #ccc;
+            }
+        ''')
+        self.export_btn.clicked.connect(self._export_report)
+        header_layout.addWidget(self.export_btn)
 
         close_btn = QPushButton('关闭')
         close_btn.setStyleSheet('''
@@ -440,6 +537,107 @@ class CompareWindow(QDialog):
     def _toggle_ruler(self, checked: bool):
         self.top_widget.set_show_ruler(checked)
         self.bottom_widget.set_show_ruler(checked)
+
+    def _export_report(self):
+        visit1_id = self.visit1_combo.currentData() if self.visit1_combo.count() > 0 else None
+        visit2_id = self.visit2_combo.currentData() if self.visit2_combo.count() > 0 else None
+
+        if not visit1_id or not visit2_id:
+            QMessageBox.warning(self, '提示', '请先选择两次复诊记录')
+            return
+
+        current_position = None
+        for code, btn in self.position_buttons.items():
+            if btn.isChecked():
+                current_position = code
+                break
+
+        if not current_position:
+            QMessageBox.warning(self, '提示', '请先选择一个拍摄角度')
+            return
+
+        photo1 = self.visit_photos.get(visit1_id, {}).get(current_position)
+        photo2 = self.visit_photos.get(visit2_id, {}).get(current_position)
+
+        if not photo1 and not photo2:
+            QMessageBox.warning(self, '提示', '当前角度没有照片可以导出')
+            return
+
+        pos_name = next((p['name'] for p in SHOOT_POSITIONS if p['code'] == current_position), current_position)
+        visit1 = next((v for v in self.visits if v.id == visit1_id), None)
+        visit2 = next((v for v in self.visits if v.id == visit2_id), None)
+
+        stage1 = next((s['name'] for s in TREATMENT_STAGES if s['code'] == visit1.stage_code), '') if visit1 else ''
+        stage2 = next((s['name'] for s in TREATMENT_STAGES if s['code'] == visit2.stage_code), '') if visit2 else ''
+
+        date1 = visit1.visit_date if visit1 else '未选择'
+        date2 = visit2.visit_date if visit2 else '未选择'
+
+        img_width = 1000
+        header_height = 120
+        img_height = header_height + 600 * 2 + 40
+
+        report_image = QImage(img_width, img_height, QImage.Format_RGB32)
+        report_image.fill(QColor(255, 255, 255))
+
+        painter = QPainter(report_image)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+        header_rect = QRect(0, 0, img_width, header_height)
+        painter.fillRect(header_rect, QColor(15, 101, 192))
+
+        painter.setPen(QColor(255, 255, 255))
+        painter.setFont(QFont('Microsoft YaHei', 20, QFont.Bold))
+        painter.drawText(header_rect, Qt.AlignHCenter | Qt.AlignTop, '口腔正畸复诊对比报告')
+
+        painter.setFont(QFont('Microsoft YaHei', 12))
+        info_text = f'患者：{self.patient.name}'
+        if self.patient.medical_record_number:
+            info_text += f'  |  病历号：{self.patient.medical_record_number}'
+        if self.patient.phone:
+            info_text += f'  |  电话：{self.patient.phone}'
+        painter.drawText(header_rect.adjusted(30, 50, -30, 0), Qt.AlignLeft | Qt.AlignTop, info_text)
+
+        pos_text = f'拍摄角度：{pos_name}'
+        painter.drawText(header_rect.adjusted(30, 75, -30, 0), Qt.AlignLeft | Qt.AlignTop, pos_text)
+
+        export_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        painter.drawText(header_rect.adjusted(-30, 75, -30, 0), Qt.AlignRight | Qt.AlignTop, f'导出时间：{export_time}')
+
+        top_img = self.top_widget.render_to_image(940, 580)
+        bottom_img = self.bottom_widget.render_to_image(940, 580)
+
+        top_y = header_height + 20
+        painter.drawImage(30, top_y, top_img)
+
+        top_label_rect = QRect(30, top_y + 10, 940, 30)
+        painter.fillRect(top_label_rect, QColor(0, 0, 0, 150))
+        painter.setPen(QColor(255, 255, 255))
+        painter.setFont(QFont('Microsoft YaHei', 11, QFont.Bold))
+        painter.drawText(top_label_rect.adjusted(15, 0, -15, 0), Qt.AlignVCenter | Qt.AlignLeft,
+                         f'▲ 早期：{date1}  {stage1}')
+
+        bottom_y = header_height + 20 + 600
+        painter.drawImage(30, bottom_y, bottom_img)
+
+        bottom_label_rect = QRect(30, bottom_y + 10, 940, 30)
+        painter.fillRect(bottom_label_rect, QColor(0, 0, 0, 150))
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(bottom_label_rect.adjusted(15, 0, -15, 0), Qt.AlignVCenter | Qt.AlignLeft,
+                         f'▼ 后期：{date2}  {stage2}')
+
+        painter.end()
+
+        patient_dir = self.patient.get_photo_dir()
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"对比报告_{pos_name}_{date1}_vs_{date2}_{timestamp}.png"
+        save_path = os.path.join(patient_dir, filename)
+
+        if report_image.save(save_path, 'PNG'):
+            QMessageBox.information(self, '导出成功', f'对比报告已保存到：\n{save_path}')
+        else:
+            QMessageBox.critical(self, '导出失败', '保存图片时发生错误，请检查文件夹权限')
 
     def closeEvent(self, event):
         self.compare_finished.emit()

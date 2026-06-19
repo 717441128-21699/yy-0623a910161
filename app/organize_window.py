@@ -9,7 +9,12 @@ from PySide6.QtCore import Qt, Signal, QMimeData
 from PySide6.QtGui import QPixmap, QFont, QPainter, QColor, QBrush, QDrag, QPen
 
 from .database import Database
-from .models import Patient, Visit, Photo, Note, SHOOT_POSITIONS, TREATMENT_STAGES
+from .models import (
+    Patient, Visit, Photo, Note, UndoAction,
+    SHOOT_POSITIONS, TREATMENT_STAGES,
+    backup_photo_for_undo, restore_photo_from_backup,
+    PHOTO_STATUS_TAKEN
+)
 
 
 class PhotoSlot(QFrame):
@@ -331,9 +336,11 @@ class OrganizeWindow(QDialog):
             return
 
         old_photo = None
+        old_file_backup = None
         slot = self.photo_slots[position_code]
         if slot.photo:
             old_photo = slot.photo
+            old_file_backup = backup_photo_for_undo(old_photo)
             Database.delete_photo(slot.photo.id)
 
         photo = Photo(
@@ -341,13 +348,21 @@ class OrganizeWindow(QDialog):
             position_code=position_code,
             file_path=dest_path,
             file_name=os.path.basename(dest_path),
+            status=PHOTO_STATUS_TAKEN,
             taken_at=datetime.now(),
             imported=True
         )
         photo_id = Database.add_photo(photo)
         photo.id = photo_id
 
-        self.undo_stack.append(('add', position_code, old_photo, photo))
+        undo_action = UndoAction(
+            action_type='replace' if old_photo else 'add',
+            position_code=position_code,
+            old_photo=old_photo,
+            new_photo=photo,
+            old_file_backup=old_file_backup
+        )
+        self.undo_stack.append(undo_action)
         self.undo_btn.setEnabled(True)
 
         slot.set_photo(photo)
@@ -362,9 +377,17 @@ class OrganizeWindow(QDialog):
             return
 
         position_code = photo.position_code
+        old_file_backup = backup_photo_for_undo(photo)
         Database.delete_photo(photo_id)
 
-        self.undo_stack.append(('remove', position_code, photo, None))
+        undo_action = UndoAction(
+            action_type='remove',
+            position_code=position_code,
+            old_photo=photo,
+            new_photo=None,
+            old_file_backup=old_file_backup
+        )
+        self.undo_stack.append(undo_action)
         self.undo_btn.setEnabled(True)
 
         slot = self.photo_slots[position_code]
@@ -375,21 +398,57 @@ class OrganizeWindow(QDialog):
         if not self.undo_stack:
             return
 
-        action, position_code, old_photo, new_photo = self.undo_stack.pop()
-        slot = self.photo_slots[position_code]
+        undo_action = self.undo_stack.pop()
+        slot = self.photo_slots[undo_action.position_code]
 
-        if action == 'add':
-            if new_photo:
-                Database.delete_photo(new_photo.id)
-            if old_photo:
-                Database.add_photo(old_photo)
-                slot.set_photo(old_photo)
+        if undo_action.action_type in ('add', 'replace'):
+            if undo_action.new_photo:
+                Database.delete_photo(undo_action.new_photo.id)
+
+            if undo_action.old_photo:
+                if undo_action.old_file_backup:
+                    restore_photo_from_backup(
+                        undo_action.old_file_backup,
+                        undo_action.old_photo.file_path
+                    )
+                old_photo_copy = Photo(
+                    id=None,
+                    visit_id=undo_action.old_photo.visit_id,
+                    position_code=undo_action.old_photo.position_code,
+                    file_path=undo_action.old_photo.file_path,
+                    file_name=undo_action.old_photo.file_name,
+                    status=undo_action.old_photo.status,
+                    taken_at=undo_action.old_photo.taken_at,
+                    imported=undo_action.old_photo.imported
+                )
+                new_id = Database.add_photo(old_photo_copy)
+                old_photo_copy.id = new_id
+                slot.set_photo(old_photo_copy)
             else:
                 slot.clear_photo()
-        else:
-            if old_photo:
-                Database.add_photo(old_photo)
-                slot.set_photo(old_photo)
+
+        elif undo_action.action_type == 'remove':
+            if undo_action.old_photo:
+                if undo_action.old_file_backup:
+                    restore_photo_from_backup(
+                        undo_action.old_file_backup,
+                        undo_action.old_photo.file_path
+                    )
+                old_photo_copy = Photo(
+                    id=None,
+                    visit_id=undo_action.old_photo.visit_id,
+                    position_code=undo_action.old_photo.position_code,
+                    file_path=undo_action.old_photo.file_path,
+                    file_name=undo_action.old_photo.file_name,
+                    status=undo_action.old_photo.status,
+                    taken_at=undo_action.old_photo.taken_at,
+                    imported=undo_action.old_photo.imported
+                )
+                new_id = Database.add_photo(old_photo_copy)
+                old_photo_copy.id = new_id
+                slot.set_photo(old_photo_copy)
+
+        undo_action.cleanup()
 
         if not self.undo_stack:
             self.undo_btn.setEnabled(False)
@@ -434,13 +493,21 @@ class OrganizeWindow(QDialog):
                     position_code=position_code,
                     file_path=dest_path,
                     file_name=os.path.basename(dest_path),
+                    status=PHOTO_STATUS_TAKEN,
                     taken_at=datetime.now(),
                     imported=True
                 )
                 photo_id = Database.add_photo(photo)
                 photo.id = photo_id
 
-                self.undo_stack.append(('add', position_code, None, photo))
+                undo_action = UndoAction(
+                    action_type='add',
+                    position_code=position_code,
+                    old_photo=None,
+                    new_photo=photo,
+                    old_file_backup=None
+                )
+                self.undo_stack.append(undo_action)
                 self.photo_slots[position_code].set_photo(photo)
 
         if import_count > 0:

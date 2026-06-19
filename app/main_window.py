@@ -1,11 +1,12 @@
+import os
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
-    QPushButton, QLabel, QHBoxLayout, QLineEdit, QMessageBox, QDialog,
-    QComboBox, QSpinBox, QDialogButtonBox, QHeaderView, QTableWidget, QTableWidgetItem
+    QPushButton, QLabel, QLineEdit, QMessageBox, QDialog,
+    QComboBox, QSpinBox, QDialogButtonBox, QTimeEdit, QFileDialog
 )
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
-from datetime import date
+from PySide6.QtCore import Qt, Signal, QTime
+from PySide6.QtGui import QFont, QColor
+from datetime import date, time
 
 from .database import Database
 from .models import Patient, Visit, TREATMENT_STAGES
@@ -15,44 +16,56 @@ class AddPatientDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle('新增患者')
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(420)
 
         layout = QVBoxLayout(self)
-
         form_layout = QVBoxLayout()
+        form_layout.setSpacing(8)
 
         self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText('患者姓名')
+        self.name_edit.setPlaceholderText('患者姓名 *')
         form_layout.addWidget(self.name_edit)
 
+        row1 = QHBoxLayout()
         self.phone_edit = QLineEdit()
         self.phone_edit.setPlaceholderText('联系电话')
-        form_layout.addWidget(self.phone_edit)
+        row1.addWidget(self.phone_edit, 1)
+        self.mrn_edit = QLineEdit()
+        self.mrn_edit.setPlaceholderText('病历号')
+        row1.addWidget(self.mrn_edit, 1)
+        form_layout.addLayout(row1)
 
-        age_layout = QHBoxLayout()
+        row2 = QHBoxLayout()
         self.age_spin = QSpinBox()
         self.age_spin.setRange(0, 100)
         self.age_spin.setPrefix('年龄: ')
-        age_layout.addWidget(self.age_spin)
-
+        row2.addWidget(self.age_spin, 1)
         self.gender_combo = QComboBox()
         self.gender_combo.addItems(['', '男', '女'])
         self.gender_combo.setPlaceholderText('性别')
-        age_layout.addWidget(self.gender_combo)
-        form_layout.addLayout(age_layout)
+        row2.addWidget(self.gender_combo, 1)
+        form_layout.addLayout(row2)
 
         self.plan_edit = QLineEdit()
         self.plan_edit.setPlaceholderText('治疗方案（如：正畸、种植）')
         form_layout.addWidget(self.plan_edit)
 
-        stage_layout = QHBoxLayout()
+        row3 = QHBoxLayout()
         stage_label = QLabel('疗程阶段:')
         self.stage_combo = QComboBox()
         for stage in TREATMENT_STAGES:
             self.stage_combo.addItem(stage['name'], stage['code'])
-        stage_layout.addWidget(stage_label)
-        stage_layout.addWidget(self.stage_combo)
-        form_layout.addLayout(stage_layout)
+        row3.addWidget(stage_label)
+        row3.addWidget(self.stage_combo, 1)
+        time_label = QLabel('预约时间:')
+        self.time_edit = QTimeEdit()
+        self.time_edit.setDisplayFormat('HH:mm')
+        self.time_edit.setTime(QTime(9, 0))
+        self.time_edit.setMinimumTime(QTime(8, 0))
+        self.time_edit.setMaximumTime(QTime(20, 0))
+        row3.addWidget(time_label)
+        row3.addWidget(self.time_edit, 1)
+        form_layout.addLayout(row3)
 
         layout.addLayout(form_layout)
 
@@ -62,13 +75,17 @@ class AddPatientDialog(QDialog):
         layout.addWidget(buttons)
 
     def get_patient_data(self):
-        return Patient(
+        time_val = self.time_edit.time()
+        appointment_time = time(time_val.hour(), time_val.minute())
+        patient = Patient(
             name=self.name_edit.text().strip(),
             phone=self.phone_edit.text().strip(),
+            medical_record_number=self.mrn_edit.text().strip(),
             age=self.age_spin.value() if self.age_spin.value() > 0 else None,
             gender=self.gender_combo.currentText(),
             treatment_plan=self.plan_edit.text().strip()
-        ), self.stage_combo.currentData()
+        )
+        return patient, self.stage_combo.currentData(), appointment_time
 
 
 class MainWindow(QMainWindow):
@@ -79,7 +96,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('口腔拍照归档工具')
-        self.resize(1000, 700)
+        self.resize(1050, 720)
         self.patient_visits = {}
         self._init_ui()
         self._load_visit_list()
@@ -88,22 +105,42 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(12)
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
 
+        header_row = QHBoxLayout()
         header = QLabel(f"今日复诊名单")
         header_font = QFont()
         header_font.setPointSize(16)
         header_font.setBold(True)
         header.setFont(header_font)
-        left_layout.addWidget(header)
+        header_row.addWidget(header)
+        header_row.addStretch()
 
-        date_label = QLabel(date.today().strftime('%Y年%m月%d日'))
-        date_label.setStyleSheet('color: #666;')
+        import_btn = QPushButton('📥 导入')
+        import_btn.setStyleSheet('''
+            QPushButton {
+                background: #2e7d32;
+                color: white;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            QPushButton:hover { background: #1b5e20; }
+        ''')
+        import_btn.clicked.connect(self._on_import_csv)
+        header_row.addWidget(import_btn)
+
+        left_layout.addLayout(header_row)
+
+        date_label = QLabel(date.today().strftime('%Y年%m月%d日  %A'))
+        date_label.setStyleSheet('color: #666; font-size: 13px;')
         left_layout.addWidget(date_label)
 
         self.visit_list = QListWidget()
@@ -114,9 +151,10 @@ class MainWindow(QMainWindow):
                 border: 1px solid #ddd;
                 border-radius: 8px;
                 background: white;
+                font-size: 13px;
             }
             QListWidget::item {
-                padding: 12px;
+                padding: 10px 12px;
                 border-bottom: 1px solid #f0f0f0;
             }
             QListWidget::item:selected {
@@ -126,7 +164,8 @@ class MainWindow(QMainWindow):
         ''')
         left_layout.addWidget(self.visit_list, 1)
 
-        add_btn = QPushButton('+ 新增患者')
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton('+ 新增')
         add_btn.setStyleSheet('''
             QPushButton {
                 background: #1976d2;
@@ -134,14 +173,28 @@ class MainWindow(QMainWindow):
                 border: none;
                 padding: 10px;
                 border-radius: 6px;
-                font-size: 14px;
+                font-size: 13px;
             }
-            QPushButton:hover {
-                background: #1565c0;
-            }
+            QPushButton:hover { background: #1565c0; }
         ''')
         add_btn.clicked.connect(self._on_add_patient)
-        left_layout.addWidget(add_btn)
+        btn_row.addWidget(add_btn, 1)
+
+        refresh_btn = QPushButton('⟳ 刷新')
+        refresh_btn.setStyleSheet('''
+            QPushButton {
+                background: #78909c;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 6px;
+                font-size: 13px;
+            }
+            QPushButton:hover { background: #546e7a; }
+        ''')
+        refresh_btn.clicked.connect(self._load_visit_list)
+        btn_row.addWidget(refresh_btn, 1)
+        left_layout.addLayout(btn_row)
 
         main_layout.addWidget(left_panel, 1)
 
@@ -226,8 +279,9 @@ class MainWindow(QMainWindow):
         visits = Database.get_today_visits()
 
         if not visits:
-            item = QListWidgetItem('暂无今日复诊患者')
+            item = QListWidgetItem('📋  暂无今日复诊患者\n点击「导入」从CSV导入预约名单，或点击「新增」添加')
             item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
+            item.setTextAlignment(Qt.AlignCenter)
             self.visit_list.addItem(item)
             return
 
@@ -236,12 +290,73 @@ class MainWindow(QMainWindow):
                 (s['name'] for s in TREATMENT_STAGES if s['code'] == visit.stage_code),
                 visit.stage_code
             )
-            item_text = f"{patient.name}  |  {stage_name}"
+
+            time_display = visit.get_appointment_display()
+            if time_display:
+                time_text = f'🕐 {time_display}  '
+            else:
+                time_text = '⏱ 未安排  '
+
+            item_text = f'{time_text}{patient.name}'
+
+            identifier = patient.get_display_identifier()
+            if identifier:
+                item_text += f'\n   {identifier}'
+
+            item_text += f'  |  {stage_name}'
             if patient.age:
-                item_text += f"  |  {patient.age}岁"
+                item_text += f'  |  {patient.age}岁'
+
             item = QListWidgetItem(item_text)
             item.setData(Qt.UserRole, (patient.id, visit.id))
+
+            if not time_display:
+                item.setForeground(QColor('#999'))
+
             self.visit_list.addItem(item)
+
+    def _on_import_csv(self):
+        file_dialog = QFileDialog()
+        file_path, _ = file_dialog.getOpenFileName(
+            self,
+            '选择预约名单CSV文件',
+            '',
+            'CSV文件 (*.csv)'
+        )
+
+        if not file_path:
+            return
+
+        reply = QMessageBox.question(
+            self, '确认导入',
+            f'确定要导入 {os.path.basename(file_path)} 吗？\n\n'
+            'CSV格式要求：\n'
+            '• 第一行为表头，必须包含「姓名」列\n'
+            '• 可选列：电话、病历号、时间段、年龄、性别、治疗方案\n'
+            '• 时间段格式：09:00、09.00、9点30分等',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        imported_count, errors = Database.import_appointments_from_csv(file_path)
+
+        self._load_visit_list()
+
+        if imported_count > 0:
+            msg = f'✓ 成功导入 {imported_count} 条预约'
+            if errors:
+                msg += f'\n\n⚠ 存在 {len(errors)} 个问题：\n' + '\n'.join(errors[:10])
+                if len(errors) > 10:
+                    msg += f'\n... 还有 {len(errors) - 10} 条问题未显示'
+            QMessageBox.information(self, '导入完成', msg)
+        else:
+            if errors:
+                QMessageBox.warning(self, '导入失败', '\n'.join(errors))
+            else:
+                QMessageBox.information(self, '导入完成', '没有新的预约需要导入')
 
     def _on_visit_double_clicked(self, item):
         data = item.data(Qt.UserRole)
@@ -276,7 +391,7 @@ class MainWindow(QMainWindow):
     def _on_add_patient(self):
         dialog = AddPatientDialog(self)
         if dialog.exec() == QDialog.Accepted:
-            patient, stage_code = dialog.get_patient_data()
+            patient, stage_code, appointment_time = dialog.get_patient_data()
 
             if not patient.name:
                 QMessageBox.warning(self, '提示', '请输入患者姓名')
@@ -286,6 +401,7 @@ class MainWindow(QMainWindow):
             visit = Visit(
                 patient_id=patient_id,
                 visit_date=date.today(),
+                appointment_time=appointment_time,
                 stage_code=stage_code
             )
             visit_id = Database.add_visit(visit)
