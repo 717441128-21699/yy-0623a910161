@@ -13,7 +13,8 @@ from .models import (
     Patient, Visit, Photo, Note, UndoAction,
     SHOOT_POSITIONS, TREATMENT_STAGES,
     backup_photo_for_undo, restore_photo_from_backup,
-    PHOTO_STATUS_TAKEN
+    PHOTO_STATUS_TAKEN, PHOTO_STATUS_PENDING, PHOTO_STATUS_MISSING, PHOTO_STATUS_SKIPPED,
+    PHOTO_STATUS_DISPLAY
 )
 
 
@@ -78,7 +79,10 @@ class PhotoSlot(QFrame):
         self.setGraphicsEffect(shadow)
 
     def _update_content(self):
-        if self.photo and os.path.exists(self.photo.file_path):
+        has_real_photo = (self.photo and self.photo.status == PHOTO_STATUS_TAKEN 
+                         and self.photo.file_path and os.path.exists(self.photo.file_path))
+        
+        if has_real_photo:
             pixmap = QPixmap(self.photo.file_path)
             if not pixmap.isNull():
                 scaled = pixmap.scaled(
@@ -98,18 +102,49 @@ class PhotoSlot(QFrame):
                 self.status_label.setStyleSheet('color: #4caf50; font-size: 11px; font-weight: bold;')
                 return
 
-        self.image_label.setText('+')
-        self.image_label.setStyleSheet('''
-            QLabel {
-                border: 2px dashed #bdbdbd;
+        status_text = '拖入照片'
+        status_color = '#9e9e9e'
+        border_color = '#bdbdbd'
+        bg_color = '#fafafa'
+        icon_text = '+'
+
+        if self.photo:
+            if self.photo.status == PHOTO_STATUS_MISSING:
+                status_text = '⚠ 缺拍'
+                status_color = '#e53935'
+                border_color = '#ef9a9a'
+                bg_color = '#ffebee'
+                icon_text = '⚠'
+            elif self.photo.status == PHOTO_STATUS_SKIPPED:
+                status_text = '⏭ 跳过'
+                status_color = '#f9a825'
+                border_color = '#ffe082'
+                bg_color = '#fffde7'
+                icon_text = '⏭'
+            elif self.photo.status == PHOTO_STATUS_PENDING:
+                status_text = '待拍'
+                status_color = '#666'
+                icon_text = '○'
+
+        self.image_label.setText(icon_text)
+        self.image_label.setStyleSheet(f'''
+            QLabel {{
+                border: 2px dashed {border_color};
                 border-radius: 6px;
-                background: #fafafa;
-                color: #9e9e9e;
+                background: {bg_color};
+                color: {status_color};
                 font-size: 28px;
-            }
+            }}
         ''')
-        self.status_label.setText('拖入照片')
-        self.status_label.setStyleSheet('color: #9e9e9e; font-size: 11px;')
+        self.status_label.setText(status_text)
+        self.status_label.setStyleSheet(f'color: {status_color}; font-size: 11px; font-weight: bold;')
+
+    def has_real_photo(self) -> bool:
+        return (self.photo and self.photo.status == PHOTO_STATUS_TAKEN 
+                and self.photo.file_path and os.path.exists(self.photo.file_path))
+
+    def is_empty_slot(self) -> bool:
+        return not self.has_real_photo()
 
     def set_photo(self, photo: Photo):
         self.photo = photo
@@ -340,7 +375,8 @@ class OrganizeWindow(QDialog):
         slot = self.photo_slots[position_code]
         if slot.photo:
             old_photo = slot.photo
-            old_file_backup = backup_photo_for_undo(old_photo)
+            if slot.has_real_photo():
+                old_file_backup = backup_photo_for_undo(old_photo)
             Database.delete_photo(slot.photo.id)
 
         photo = Photo(
@@ -470,11 +506,11 @@ class OrganizeWindow(QDialog):
 
         empty_positions = [
             pos['code'] for pos in SHOOT_POSITIONS
-            if not self.photo_slots[pos['code']].photo
+            if self.photo_slots[pos['code']].is_empty_slot()
         ]
 
         if not empty_positions:
-            QMessageBox.information(self, '提示', '所有拍摄位都已填满照片')
+            QMessageBox.information(self, '提示', '所有拍摄位都已有照片')
             return
 
         import_count = min(len(file_paths), len(empty_positions))
@@ -488,6 +524,15 @@ class OrganizeWindow(QDialog):
             )
 
             if dest_path:
+                old_photo = None
+                old_file_backup = None
+                slot = self.photo_slots[position_code]
+                if slot.photo:
+                    old_photo = slot.photo
+                    if slot.has_real_photo():
+                        old_file_backup = backup_photo_for_undo(old_photo)
+                    Database.delete_photo(slot.photo.id)
+
                 photo = Photo(
                     visit_id=self.visit_id,
                     position_code=position_code,
@@ -501,11 +546,11 @@ class OrganizeWindow(QDialog):
                 photo.id = photo_id
 
                 undo_action = UndoAction(
-                    action_type='add',
+                    action_type='replace' if old_photo else 'add',
                     position_code=position_code,
-                    old_photo=None,
+                    old_photo=old_photo,
                     new_photo=photo,
-                    old_file_backup=None
+                    old_file_backup=old_file_backup
                 )
                 self.undo_stack.append(undo_action)
                 self.photo_slots[position_code].set_photo(photo)
@@ -516,9 +561,18 @@ class OrganizeWindow(QDialog):
             self.status_label.setText(f'✓ 已导入 {import_count} 张照片')
 
     def _update_status(self):
-        filled = sum(1 for slot in self.photo_slots.values() if slot.photo)
+        filled = sum(1 for slot in self.photo_slots.values() if slot.has_real_photo())
         total = len(self.photo_slots)
-        self.status_label.setText(f'已归位 {filled}/{total} 张照片')
+        missing = sum(1 for slot in self.photo_slots.values() 
+                     if slot.photo and slot.photo.status == PHOTO_STATUS_MISSING)
+        skipped = sum(1 for slot in self.photo_slots.values() 
+                     if slot.photo and slot.photo.status == PHOTO_STATUS_SKIPPED)
+        status_text = f'已归位 {filled}/{total} 张'
+        if missing > 0:
+            status_text += f'  |  缺拍 {missing}'
+        if skipped > 0:
+            status_text += f'  |  跳过 {skipped}'
+        self.status_label.setText(status_text)
 
     def closeEvent(self, event):
         self.organize_finished.emit()

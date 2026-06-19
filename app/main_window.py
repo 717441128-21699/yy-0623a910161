@@ -273,55 +273,70 @@ class MainWindow(QMainWindow):
         self.compare_btn.setEnabled(enabled)
 
     def _load_visit_list(self):
-        self.visit_list.clear()
-        self.patient_visits.clear()
+        try:
+            self.visit_list.clear()
+            self.patient_visits.clear()
+            self._set_buttons_enabled(False)
+            self.status_label.setText('加载中...')
 
-        visits = Database.get_today_visits()
+            visits = Database.get_today_visits()
 
-        if not visits:
-            item = QListWidgetItem('📋  暂无今日复诊患者\n点击「导入」从CSV导入预约名单，或点击「新增」添加')
+            if not visits:
+                item = QListWidgetItem('📋  暂无今日复诊患者\n点击「导入」从CSV/Excel导入预约名单，或点击「新增」添加')
+                item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
+                item.setTextAlignment(Qt.AlignCenter)
+                self.visit_list.addItem(item)
+                self.status_label.setText('暂无今日复诊患者')
+                return
+
+            for patient, visit in visits:
+                stage_name = next(
+                    (s['name'] for s in TREATMENT_STAGES if s['code'] == visit.stage_code),
+                    visit.stage_code
+                )
+
+                time_display = visit.get_appointment_display()
+                if time_display:
+                    time_text = f'🕐 {time_display}  '
+                else:
+                    time_text = '⏱ 未安排  '
+
+                item_text = f'{time_text}{patient.name}'
+
+                identifier = patient.get_display_identifier()
+                if identifier:
+                    item_text += f'\n   {identifier}'
+
+                item_text += f'  |  {stage_name}'
+                if patient.age:
+                    item_text += f'  |  {patient.age}岁'
+
+                item = QListWidgetItem(item_text)
+                item.setData(Qt.UserRole, (patient.id, visit.id))
+
+                if not time_display:
+                    item.setForeground(QColor('#999'))
+
+                self.visit_list.addItem(item)
+
+            self.status_label.setText(f'今日共 {len(visits)} 位复诊患者')
+
+        except Exception as e:
+            print(f"Load visit list error: {e}")
+            self.visit_list.clear()
+            item = QListWidgetItem(f'❌ 加载失败：{str(e)}\n请点击「刷新」重试')
             item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
             item.setTextAlignment(Qt.AlignCenter)
             self.visit_list.addItem(item)
-            return
-
-        for patient, visit in visits:
-            stage_name = next(
-                (s['name'] for s in TREATMENT_STAGES if s['code'] == visit.stage_code),
-                visit.stage_code
-            )
-
-            time_display = visit.get_appointment_display()
-            if time_display:
-                time_text = f'🕐 {time_display}  '
-            else:
-                time_text = '⏱ 未安排  '
-
-            item_text = f'{time_text}{patient.name}'
-
-            identifier = patient.get_display_identifier()
-            if identifier:
-                item_text += f'\n   {identifier}'
-
-            item_text += f'  |  {stage_name}'
-            if patient.age:
-                item_text += f'  |  {patient.age}岁'
-
-            item = QListWidgetItem(item_text)
-            item.setData(Qt.UserRole, (patient.id, visit.id))
-
-            if not time_display:
-                item.setForeground(QColor('#999'))
-
-            self.visit_list.addItem(item)
+            self.status_label.setText('加载失败')
 
     def _on_import_csv(self):
         file_dialog = QFileDialog()
         file_path, _ = file_dialog.getOpenFileName(
             self,
-            '选择预约名单CSV文件',
+            '选择预约名单文件',
             '',
-            'CSV文件 (*.csv)'
+            '预约名单文件 (*.csv *.xlsx *.xls)'
         )
 
         if not file_path:
@@ -330,7 +345,7 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(
             self, '确认导入',
             f'确定要导入 {os.path.basename(file_path)} 吗？\n\n'
-            'CSV格式要求：\n'
+            '格式要求：\n'
             '• 第一行为表头，必须包含「姓名」列\n'
             '• 可选列：电话、病历号、时间段、年龄、性别、治疗方案\n'
             '• 时间段格式：09:00、09.00、9点30分等',
@@ -341,20 +356,27 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        imported_count, errors = Database.import_appointments_from_csv(file_path)
+        try:
+            imported_count, errors = Database.import_appointments(file_path)
+        except Exception as e:
+            QMessageBox.critical(self, '导入失败', f'导入过程中发生错误：\n{str(e)}')
+            return
 
-        self._load_visit_list()
+        try:
+            self._load_visit_list()
+        except Exception as e:
+            QMessageBox.warning(self, '刷新失败', f'数据已导入，但列表刷新失败：\n{str(e)}')
 
         if imported_count > 0:
             msg = f'✓ 成功导入 {imported_count} 条预约'
             if errors:
-                msg += f'\n\n⚠ 存在 {len(errors)} 个问题：\n' + '\n'.join(errors[:10])
-                if len(errors) > 10:
-                    msg += f'\n... 还有 {len(errors) - 10} 条问题未显示'
+                msg += f'\n\n⚠ 存在 {len(errors)} 个问题（已跳过）：\n' + '\n'.join(errors[:15])
+                if len(errors) > 15:
+                    msg += f'\n... 还有 {len(errors) - 15} 条问题未显示'
             QMessageBox.information(self, '导入完成', msg)
         else:
             if errors:
-                QMessageBox.warning(self, '导入失败', '\n'.join(errors))
+                QMessageBox.warning(self, '导入完成', '没有成功导入的预约。\n\n' + '\n'.join(errors[:10]))
             else:
                 QMessageBox.information(self, '导入完成', '没有新的预约需要导入')
 
